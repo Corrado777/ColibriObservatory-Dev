@@ -38,7 +38,7 @@ from preparedata import is_dir_too_small
 #-------------------------------global vars-----------------------------------#
 
 # Path variables
-BASE_PATH = pathlib.Path('D:/')
+BASE_PATH = pathlib.Path('/home/agirmen/research_data/ColibriPipelineSimulatedDirs/')
 DATA_PATH = BASE_PATH / 'ColibriData'
 IMGE_PATH = BASE_PATH / 'ColibriImages'
 ARCHIVE_PATH = BASE_PATH / 'ColibriArchive'

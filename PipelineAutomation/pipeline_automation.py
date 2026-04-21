@@ -85,6 +85,10 @@ TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S.%f'
 BARE_FORMAT = '%Y-%m-%d_%H%M%S_%f'
 NICE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
+# Cross-telescope wait timeout in seconds. Override with COLIBRI_PEER_TIMEOUT env var.
+# Use a short value (e.g. 300) in the simulator when peers won't actually be running.
+PEER_TIMEOUT = int(os.environ.get('COLIBRI_PEER_TIMEOUT', str(8 * 3600)))
+
 def get_repo_paths(environment: str) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     """Return GitHub root, pipeline scripts dir, and email script path for the selected environment."""
 
@@ -167,6 +171,23 @@ def get_peer_data_root(peer_telescope: str) -> pathlib.Path:
     """Build a peer telescope ColibriData root path."""
 
     return TELESCOPE_ROOTS[peer_telescope] / 'ColibriData'
+
+
+def wait_for_sentinel(sentinel_path: pathlib.Path, timeout_s: int = PEER_TIMEOUT,
+                      poll_s: int = 120) -> bool:
+    """Wait for sentinel_path to exist as a file, up to timeout_s seconds.
+
+    Returns True if the sentinel appeared, False if the deadline was exceeded.
+    Uses time.monotonic() so clock adjustments don't affect the deadline.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if sentinel_path.is_file():
+            return True
+        remaining = deadline - time.monotonic()
+        print(f"Waiting for {sentinel_path} ({remaining / 3600:.1f}h remaining)...")
+        time.sleep(min(poll_s, max(1.0, remaining)))
+    return False
 
 
 # Computer name / environment
@@ -442,10 +463,10 @@ def processArchive(obsdate, repro=False, new_stop=True, **kwargs):
     archive_dir = ARCHIVE_PATH / hyphonateDate(obsdate)
     if not raw_dir.exists():
         err.addWarning(f"WARNING: No raw data found on {obsdate}.")
-        raw_dir.mkdir()
+        raw_dir.mkdir(parents=True, exist_ok=True)
     if not archive_dir.exists():
         err.addWarning(f"WARNING: No archive directory found on {obsdate}.")
-        archive_dir.mkdir()
+        archive_dir.mkdir(parents=True, exist_ok=True)
     
     # Run all processes and get the runtime as a return
     runtime = runProcesses(raw_dir, repro=repro, new_stop=new_stop, pipe_std=obsdate, **kwargs)
@@ -477,49 +498,39 @@ def runProcesses(stopfile_dir, repro=False, new_stop=True, pipe_std=None, **kwar
         # Define the log directory and check that the directory exists
         log_dir = LOG_PATH / pipe_std
         if not log_dir.exists():
-            log_dir.mkdir()
+            log_dir.mkdir(parents=True, exist_ok=True)
 
 
     # Loop through kwargs to get processes and arguments
     # Kwarg format: {'processname' : [list_of_script_args]}
-    for process,script_args in kwargs.items():
+    for process, script_args in kwargs.items():
         stop_file = process + '.txt'
         if (stopfile_dir / stop_file).exists() and (repro is False):
             print(f"WARNING: {process} already preformed. Skipping...")
             continue
 
-        # Check if pipeing stdout and stderr to a log file
-        if pipe_std is not None:
-            # Define the log file and check that the file exists
-            log_file = log_dir / (process + '.log')
-            
-            # Use 'tee -a' to append to the log file and print to screen
-            script_args = script_args + ['|', 'tee', '-a', log_file]
-
-        # Run the process with appropriate command-line arguments
         t_start = time.time()
         try:
             print(f"Initializing subprocess {process + '.py'}...")
-            subp = subprocess.run(['python', SCRIPTS / (process + '.py'), *script_args], shell=True)
+            cmd = ['python', str(SCRIPTS / (process + '.py'))] + [str(a) for a in script_args]
 
-            # Wait until the subprocess has completed
-            try:
-                while subp.poll() is None:
-                    time.sleep(10)
-            except AttributeError:
-                pass
+            if pipe_std is not None:
+                log_file = log_dir / (process + '.log')
+                with open(log_file, 'a') as lf:
+                    subp = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            else:
+                subp = subprocess.run(cmd)
 
-            # Write new stop file if requested
-            if new_stop:
+            if subp.returncode != 0:
+                err.addError(f"ERROR: {process}.py exited with code {subp.returncode}! Stop file not written.")
+            elif new_stop:
                 print(f"Writing stop file for {process + '.py'}...")
                 with open(stopfile_dir / stop_file, 'w') as sfile:
                     sfile.write(f'python {process}.py {script_args}')
 
-        # If subprocess fails, skip the pipeline
         except Exception as Argument:
             err.addError(f"ERROR: {process + '.py'} failed with error {Argument}! Skipping...")
 
-        # Record the runtime of the subprocess
         runtime.append(time.time() - t_start)
 
     # Return the runtime of the subprocess once all subprocesses have completed
@@ -550,23 +561,18 @@ def sendStatusEmail(obsdate, stopfile_dir, repro=False, new_stop=True,
         return
 
     # Define the command-line arguments
-    # Process items in errors and notes individually
-    script_args = [obsdate, '--errors', *errors, '--notes', *notes]
+    script_args = [str(obsdate), '--errors', *errors, '--notes', *notes]
+    if ENVIRONMENT == ENV_SIM:
+        script_args.append('--dry')
 
     # Run the process with appropriate command-line arguments
     try:
         print(f"Sending daily status email...")
-        subp = subprocess.run(['python', EMAIL_SCRIPT, *script_args])
+        subp = subprocess.run(['python', str(EMAIL_SCRIPT), *script_args])
 
-        # Wait until the subprocess has completed
-        try:
-            while subp.poll() is None:
-                time.sleep(10)
-        except AttributeError:
-            pass
-
-        # Write new stop file if requested
-        if new_stop:
+        if subp.returncode != 0:
+            err.addError(f"ERROR: {EMAIL_SCRIPT.name} exited with code {subp.returncode}! Stop file not written.")
+        elif new_stop:
             print(f"Writing stop file for {EMAIL_SCRIPT.name}...")
             with open(stopfile_dir / stop_file, 'w') as sfile:
                 sfile.write(f'python {EMAIL_SCRIPT.name} {script_args}')
@@ -574,7 +580,6 @@ def sendStatusEmail(obsdate, stopfile_dir, repro=False, new_stop=True,
     # If email_timeline.py fails, send a generic email as an alert
     except Exception as Argument:
         err.addError(f"ERROR: {EMAIL_SCRIPT.name} failed with error {Argument}! Skipping...")
-        subp = subprocess.run(['python', EMAIL_SCRIPT.parent / 'generic_email.py'])
     
 
 ##############################
@@ -664,6 +669,10 @@ def ColibriProcesses(obsdate, repro=False, sigma_threshold=4, tot_runtime=[]):
     archive_runtime = processArchive(obsdate, repro=repro, new_stop=True, **archive_processes)
     tot_runtime += archive_runtime
 
+    # Signal to peers that this telescope has completed its first-pass processing.
+    # This is the sentinel the other telescopes wait on before running cross-telescope stages.
+    (ARCHIVE_PATH / hyphonateDate(obsdate) / 'done.txt').touch()
+
 ##############################
 ## Split-Responsibility Processing
 ##############################
@@ -674,27 +683,14 @@ def ColibriProcesses(obsdate, repro=False, sigma_threshold=4, tot_runtime=[]):
     if TELESCOPE == "GREENBIRD":
         print(f"\n## Processing GREENONLY1 for {obsdate}... ##\n")
 
-        # Wait until other telescopes are done
         path_RED = get_peer_archive_file('REDBIRD', obsdate, 'done.txt')
         path_BLUE = get_peer_archive_file('BLUEBIRD', obsdate, 'done.txt')
-        
-        # Wait until processing is done, if processing has started
-        while not (path_RED.is_file() == path_RED.parent.is_dir()) or \
-                not (path_BLUE.is_file() == path_BLUE.parent.is_dir()):
 
-            red_stop_exists = (path_RED.is_file() == path_RED.parent.is_dir())
-            blue_stop_exists = (path_BLUE.is_file() == path_BLUE.parent.is_dir())
+        for peer_name, peer_path in [('REDBIRD', path_RED), ('BLUEBIRD', path_BLUE)]:
+            if not wait_for_sentinel(peer_path):
+                err.addWarning(f"WARNING: {peer_name} done.txt not ready within timeout. Proceeding anyway.")
 
-            # Print status
-            if (not red_stop_exists) and (not blue_stop_exists):
-                print("Waiting for %s and %s..." % (path_RED, path_BLUE))
-            elif not red_stop_exists:
-                print("Waiting for %s..." % path_RED)
-            elif not blue_stop_exists:
-                print("Waiting for %s..." % path_BLUE)
-            time.sleep(300)
-        
-        print(f"Red and Blue are ready for GREEN {obsdate} processing.")
+        print(f"Proceeding with GREEN {obsdate} processing.")
 
         # This dictionary defines the *PYTHON* scripts which
         # handle the GREEN processes. To add a script, just add to this
@@ -712,27 +708,14 @@ def ColibriProcesses(obsdate, repro=False, sigma_threshold=4, tot_runtime=[]):
     elif TELESCOPE == "BLUEBIRD":
         print(f"\n## WCS matching for {obsdate}... ##\n")
 
-        # Wait until other telescopes are done
         path_RED = get_peer_archive_file('REDBIRD', obsdate, 'done.txt')
         path_GREEN = get_peer_archive_file('GREENBIRD', obsdate, 'done.txt')
-        
-        # Wait until processing is done, if processing has started
-        while not (path_RED.is_file() == path_RED.parent.is_dir()) or \
-                not (path_GREEN.is_file() == path_GREEN.parent.is_dir()):
 
-            red_stop_exists = (path_RED.is_file() == path_RED.parent.is_dir())
-            green_stop_exists = (path_GREEN.is_file() == path_GREEN.parent.is_dir())
+        for peer_name, peer_path in [('REDBIRD', path_RED), ('GREENBIRD', path_GREEN)]:
+            if not wait_for_sentinel(peer_path):
+                err.addWarning(f"WARNING: {peer_name} done.txt not ready within timeout. Proceeding anyway.")
 
-            # Print status
-            if (not red_stop_exists) and (not green_stop_exists):
-                print("Waiting for %s and %s..." % (path_RED, path_GREEN))
-            elif not red_stop_exists:
-                print("Waiting for %s..." % path_RED)
-            elif not green_stop_exists:
-                print("Waiting for %s..." % path_GREEN)
-            time.sleep(300)
-        
-        print(f"Red and Green are ready for BLUE {obsdate} processing.")
+        print(f"Proceeding with BLUE {obsdate} processing.")
 
         # This dictionary defines the *PYTHON* scripts which
         # handle the BLUE processes. To add a script, just add to this
@@ -759,32 +742,32 @@ def ColibriProcesses(obsdate, repro=False, sigma_threshold=4, tot_runtime=[]):
         print(f"WARNING: generate_specific_lightcurve already preformed. Skipping...")
 
     else:
-        # If the list of artificial lightcurves has not been created, wait 5 minutes
         gat_file = ARCHIVE_PATH / hyphonateDate(obsdate) / 'generate_artificial.txt'
         print(f"Waiting for the gat_file for {obsdate}...")
-        while not gat_file.exists():
-            time.sleep(300)
+        if not wait_for_sentinel(gat_file):
+            err.addWarning(f"WARNING: generate_artificial.txt not found for {obsdate} within timeout. Skipping artificial lightcurves.")
+            gat_stop.touch()
+        else:
+            # Read lines from generate_artificial.txt
+            print(f"## Generating artificial lightcurves for {obsdate}...")
+            with open(gat_file, 'r') as gat:
+                tot_gat_runtime = 0
+                for line in gat.readlines():
+                    gat_params = line.strip('\n').split(' ') + ['-m']
+                    gat_runtime = runProcesses(ARCHIVE_PATH / hyphonateDate(obsdate),
+                                                repro=True, new_stop=False,
+                                                pipe_std=obsdate,
+                                                generate_specific_lightcurve=gat_params)
+                    tot_gat_runtime += sum(filter(None, gat_runtime))
 
-        # Read lines from generate_artificial.txt
-        print(f"## Generating artificial lightcurves for {obsdate}...")
-        with open(gat_file, 'r') as gat:
-            tot_gat_runtime = 0
-            for line in gat.readlines():
-                gat_params = line.strip('\n').split(' ') + ['-m']
-                gat_runtime = runProcesses(ARCHIVE_PATH / hyphonateDate(obsdate),
-                                            repro=True, new_stop=False,
-                                            pipe_std=obsdate,
-                                            generate_specific_lightcurve=gat_params)
-                tot_gat_runtime += sum(filter(None, gat_runtime))
+            # Create stop file
+            gat_stop.touch()
 
-        # Create stop file
-        gat_stop.touch()
+            # Delete gat file
+            #gat_file.unlink()
 
-        # Delete gat file
-        #gat_file.unlink()
-
-        # Record runtime
-        tot_runtime.append(tot_gat_runtime)
+            # Record runtime
+            tot_runtime.append(tot_gat_runtime)
                 
 
 ##############################
@@ -798,27 +781,14 @@ def ColibriProcesses(obsdate, repro=False, sigma_threshold=4, tot_runtime=[]):
 
         print(f"\n## Processing endgame for {obsdate}... ##\n")
 
-        # Wait until other telescopes are done
         path_RED = get_peer_archive_file('REDBIRD', obsdate, 'timeline_ready.txt')
         path_BLUE = get_peer_archive_file('BLUEBIRD', obsdate, 'timeline_ready.txt')
-        
-        # Wait until processing is done, if processing has started
-        while not (path_RED.is_file() == path_RED.parent.is_dir()) or \
-                not (path_BLUE.is_file() == path_BLUE.parent.is_dir()):
-            
-            red_stop_exists = (path_RED.is_file() == path_RED.parent.is_dir())
-            blue_stop_exists = (path_BLUE.is_file() == path_BLUE.parent.is_dir())
 
-            # Print status
-            if (not red_stop_exists) and (not blue_stop_exists):
-                print("Waiting for %s and %s..." % (path_RED, path_BLUE))
-            elif not red_stop_exists:
-                print("Waiting for %s..." % path_RED)
-            elif not blue_stop_exists:
-                print("Waiting for %s..." % path_BLUE)
-            time.sleep(300)
-        
-        print(f"Red and Blue are ready for GREEN {obsdate} processing.")
+        for peer_name, peer_path in [('REDBIRD', path_RED), ('BLUEBIRD', path_BLUE)]:
+            if not wait_for_sentinel(peer_path):
+                err.addWarning(f"WARNING: {peer_name} timeline_ready.txt not ready within timeout. Proceeding anyway.")
+
+        print(f"Proceeding with GREEN {obsdate} endgame processing.")
 
         # Read in star-hours
         starhour_path = list((TELESCOPE_ROOTS['BLUEBIRD'] / 'ColibriArchive' / hyphonateDate(obsdate)).glob('starhours_*.txt'))
@@ -851,18 +821,22 @@ if __name__ == '__main__':
 ## Generate Warning Window
 ##############################
 
-    # Generate window
-    window = tk.Tk()
-    
-    # Create label
-    label_var = tk.StringVar()
-    label_var.set('Colibri data pipeline is running! Do not run any other programs on this machine!')
-    label = tk.Label(window, textvariable=label_var, font=('Arial',25))
-    label.pack()
-    
-    # Update and show window once
-    window.update_idletasks()
-    window.update()
+    window = None
+    try:
+        # In headless/SSH runs this can fail (no DISPLAY). Continue without GUI.
+        window = tk.Tk()
+
+        # Create label
+        label_var = tk.StringVar()
+        label_var.set('Colibri data pipeline is running! Do not run any other programs on this machine!')
+        label = tk.Label(window, textvariable=label_var, font=('Arial',25))
+        label.pack()
+
+        # Update and show window once
+        window.update_idletasks()
+        window.update()
+    except tk.TclError as gui_err:
+        print(f"Warning: GUI status window disabled ({gui_err}). Running in terminal mode.")
 
 
 ##############################
@@ -985,6 +959,7 @@ if __name__ == '__main__':
 
     # Write errors to log file
     today = datetime.now().strftime(OBSDATE_FORMAT)
+    LOG_PATH.mkdir(parents=True, exist_ok=True)
     log_file = LOG_PATH / f'{today}_pipeline.log'
     with open(log_file, 'a') as logfile:
         logfile.write("\n" + "-"*50 +  "\n")
@@ -1000,4 +975,5 @@ if __name__ == '__main__':
     cleanD()
     
     # Close tkinter window
-    window.destroy()
+    if window is not None:
+        window.destroy()
